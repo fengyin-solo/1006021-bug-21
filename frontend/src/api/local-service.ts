@@ -1,5 +1,13 @@
+import {
+  applyBridgeAction,
+  BRIDGE_KEY,
+  STAND_KEY,
+  checkSummary,
+  normalizeBridgeRow,
+  type BridgeActionPayload,
+} from '@/data/bridge-domain'
 import { MODULE_BY_KEY } from '@/data/modules'
-import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import { allRows, listRows, resetRows, saveRows, saveStore } from '@/data/local-store'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
@@ -28,7 +36,20 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
-export function runAction(key: string, id: number, action: string): ActionResult {
+// 机位动作落库后让「占用待办」与状态同源，避免机位页面动作写出第二份占用结论。
+function withStandOccupancy(row: EntryRow, target: string): EntryRow {
+  return { ...row, status: target, ['占用待办']: target === '占用中' }
+}
+
+export function runAction(
+  key: string,
+  id: number,
+  action: string,
+  payload: BridgeActionPayload = {},
+): ActionResult {
+  if (key === BRIDGE_KEY) {
+    return runBridgeAction(id, action, payload)
+  }
   const meta = moduleMeta(key)
   const target = meta.actionTargets[action]
   if (!target) {
@@ -44,11 +65,14 @@ export function runAction(key: string, id: number, action: string): ActionResult
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
   const lastStatus = meta.statuses[meta.statuses.length - 1]
-  const updated: EntryRow = {
+  let updated: EntryRow = {
     ...rows[index],
     status: target,
     pending: target !== lastStatus,
     abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
+  }
+  if (key === STAND_KEY) {
+    updated = withStandOccupancy(updated, target)
   }
   const next = [...rows]
   next[index] = updated
@@ -56,19 +80,53 @@ export function runAction(key: string, id: number, action: string): ActionResult
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
 }
 
+// 廊桥动作：走领域状态机（逐级推进、检查项闸门、异常量只结算一次），
+// 并在同一笔写入里回写对应机位的占用结论。
+function runBridgeAction(id: number, action: string, payload: BridgeActionPayload): ActionResult {
+  const store = allRows()
+  const bridges = store[BRIDGE_KEY] ?? []
+  const index = bridges.findIndex((row) => Number(row.id) === id)
+  if (index < 0) {
+    return { ok: false, message: `没有找到编号为 ${id} 的廊桥作业` }
+  }
+  const outcome = applyBridgeAction(bridges[index], action, payload)
+  if (!outcome.ok || !outcome.row) {
+    return { ok: false, message: outcome.message }
+  }
+  const nextBridges = [...bridges]
+  nextBridges[index] = outcome.row
+  // normalizeStore 内会顺带把机位占用结论对齐，廊桥/机位一笔落库。
+  saveStore({ ...store, [BRIDGE_KEY]: nextBridges })
+  return { ok: true, message: outcome.message }
+}
+
 export function resetModule(key: string): PageResult {
   resetRows(key)
   return listEntries(key)
+}
+
+function csvCell(value: unknown): string {
+  if (typeof value === 'boolean') {
+    return value ? '是' : '否'
+  }
+  return String(value ?? '')
 }
 
 export function exportEntries(key: string): { filename: string; content: string } {
   const meta = moduleMeta(key)
   const header = ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
-  for (const row of listRows(key)) {
-    lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
+  for (const source of listRows(key)) {
+    // 导出读到的也是落库对齐后的同一份数据：廊桥检查项给可读摘要。
+    const row = key === BRIDGE_KEY ? normalizeBridgeRow(source) : source
+    const values = meta.fields.map((field) =>
+      key === BRIDGE_KEY && field === '对接检查项'
+        ? checkSummary(row)
+        : csvCell(row[field]),
+    )
+    lines.push([row.id, ...values, csvCell(row.status)].join(','))
   }
-  return { filename: `${meta.name}-清单.csv`, content: `\uFEFF${lines.join('\n')}` }
+  return { filename: `${meta.name}-清单.csv`, content: `﻿${lines.join('\n')}` }
 }
 
 export function downloadEntries(key: string): void {
@@ -92,6 +150,8 @@ export function loadOverview(): OverviewResult {
       name: meta.name,
       created: entries.length,
       pending: entries.filter((row) => row.pending).length,
+      // 异常量唯一口径：动作落库时结算的 abnormal 标记（廊桥仅「异常中止」）。
+      // 概览不再照着检查项重算一遍，同一次撤离在作业记录与概览里必须是同一份结论。
       abnormal: entries.filter((row) => row.abnormal).length,
     }
   })

@@ -43,7 +43,10 @@
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in columns" :key="column">
+            <template v-if="column === '占用待办'">{{ row[column] ? '是' : '否' }}</template>
+            <template v-else>{{ row[column] === '' || row[column] == null ? '—' : row[column] }}</template>
+          </td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
             <button
@@ -82,7 +85,7 @@ import {
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('stand')
-const columns = ["机位编号", "机位类型", "适用机型", "廊桥配置", "近远机位", "占用时段", "当前航班", "机位状态"]
+const columns = ["机位编号", "机位类型", "适用机型", "廊桥配置", "近远机位", "占用时段", "当前航班", "占用待办", "机位状态"]
 const actions = ["分配机位", "释放机位", "封闭机位"]
 const statuses = ["空闲", "占用中", "维护中", "已封闭"]
 const stats = [{"label": "可用机位", "value": 0}, {"label": "占用中机位", "value": 0}, {"label": "封闭机位", "value": 0}]
