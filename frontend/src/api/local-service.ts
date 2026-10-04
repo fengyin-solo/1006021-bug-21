@@ -1,6 +1,15 @@
+import {
+  BRIDGE_ACTIONS,
+  BRIDGE_FIELDS,
+  BRIDGE_KEY,
+  STAND_KEY,
+  activeBridgeOnStand,
+  applyBridgeAction,
+  setBridgeCheckResult,
+} from '@/data/bridge'
 import { MODULE_BY_KEY } from '@/data/modules'
-import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
-import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
+import { allRows, listRows, resetRows, saveRows, saveRowsBatch } from '@/data/local-store'
+import type { ActionResult, CheckItem, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
 const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
@@ -34,6 +43,21 @@ export function runAction(key: string, id: number, action: string): ActionResult
   if (!target) {
     return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
   }
+
+  // 廊桥作业走领域结算：检查项结论与作业状态在同一写入里对齐，并原子回写停机位占用。
+  if (key === BRIDGE_KEY && Object.values(BRIDGE_ACTIONS).includes(action as (typeof BRIDGE_ACTIONS)[keyof typeof BRIDGE_ACTIONS])) {
+    const outcome = applyBridgeAction(listRows(BRIDGE_KEY), listRows(STAND_KEY), id, action)
+    if (!outcome.result.ok) {
+      return outcome.result
+    }
+    const patch: Record<string, EntryRow[]> = { [BRIDGE_KEY]: outcome.bridges }
+    if (outcome.standsChanged) {
+      patch[STAND_KEY] = outcome.stands
+    }
+    saveRowsBatch(patch)
+    return outcome.result
+  }
+
   const rows = listRows(key)
   const index = rows.findIndex((row) => Number(row.id) === id)
   if (index < 0) {
@@ -43,6 +67,23 @@ export function runAction(key: string, id: number, action: string): ActionResult
   if (current === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
+  const allowed = meta.transitions?.[current]
+  if (allowed && !allowed.includes(target)) {
+    return { ok: false, message: `${meta.entity}当前为「${current}」，不能直接流转到「${target}」，请按状态逐级推进` }
+  }
+  // 跨模块闸口：仍有在桥作业占着的停机位，不能从机位侧绕过廊桥释放/封闭，
+  // 否则机位占用会和廊桥撤离结论两份不一样。
+  if (key === STAND_KEY && (target === '空闲' || target === '已封闭')) {
+    const standNo = String(rows[index]['机位编号'] ?? '')
+    const bridgeRow = activeBridgeOnStand(listRows(BRIDGE_KEY), standNo)
+    if (bridgeRow) {
+      const code = String(bridgeRow[BRIDGE_FIELDS.code] ?? '')
+      return {
+        ok: false,
+        message: `机位 ${standNo} 仍被廊桥作业 ${code}（${String(bridgeRow.status)}）占用，须先在廊桥靠接里完成撤离或处置中止后再${action}`,
+      }
+    }
+  }
   const lastStatus = meta.statuses[meta.statuses.length - 1]
   const updated: EntryRow = {
     ...rows[index],
@@ -50,10 +91,29 @@ export function runAction(key: string, id: number, action: string): ActionResult
     pending: target !== lastStatus,
     abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
   }
+  // 各模块末尾的展示状态字段（如「机位状态」）与 status 同步，防止一个实体两份状态。
+  const statusField = meta.fields.find((field) => field.endsWith('状态'))
+  if (statusField) {
+    updated[statusField] = target
+  }
   const next = [...rows]
   next[index] = updated
   saveRows(key, next)
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
+}
+
+/** 廊桥对接检查项逐项登记结论；只允许在对应相位录入，终态凭证封档不可改。 */
+export function recordBridgeCheck(
+  id: number,
+  phase: CheckItem['phase'],
+  name: string,
+  result: CheckItem['result'],
+): ActionResult {
+  const { result: actionResult, bridges } = setBridgeCheckResult(listRows(BRIDGE_KEY), id, phase, name, result)
+  if (actionResult.ok) {
+    saveRows(BRIDGE_KEY, bridges)
+  }
+  return actionResult
 }
 
 export function resetModule(key: string): PageResult {
@@ -85,6 +145,8 @@ export function downloadEntries(key: string): void {
 }
 
 export function loadOverview(): OverviewResult {
+  // 概览只读取落库时已结算好的 abnormal/pending，绝不再按检查项二次推算，
+  // 同一次撤离在作业记录与概览里只能是同一个结论。
   const rows = allRows()
   const modules = [...MODULE_BY_KEY.values()].map((meta) => {
     const entries = rows[meta.key] ?? []
@@ -103,3 +165,5 @@ export function loadOverview(): OverviewResult {
   ]
   return { cards, modules }
 }
+
+export { BRIDGE_FIELDS }
